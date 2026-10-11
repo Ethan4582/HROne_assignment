@@ -1,292 +1,69 @@
-import calendar
 from contextlib import asynccontextmanager
-from datetime import date, datetime, time, timedelta, timezone
-from decimal import Decimal, ROUND_HALF_UP
+from datetime import date, datetime, timezone
 import os
-from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, Literal, Optional
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Path, Query, status
-from pydantic import BaseModel, BeforeValidator, Field, field_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from fastapi import FastAPI, HTTPException, Path, Query
+from pymongo import ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-# ==============================================================================
-# SECTION 1: CONFIG & DATABASE CLIENT
-# ==============================================================================
-load_dotenv(override=False)
+from app.db import client, db, round_half_up
+from app.helpers import (
+    ALL_STATUSES,
+    GRACE_PERIOD_SECONDS,
+    HALF_DAY_HOURS_THRESHOLD,
+    IST,
+    OVERTIME_MINIMUM_MINUTES,
+    PRESENCE_STATUSES,
+    attendance_date,
+    calculate_working_days,
+    compute_half_day,
+    compute_late_minutes,
+    compute_overtime_minutes,
+    compute_work_hours,
+    datetime_to_epoch_ms,
+    epoch_ms_to_datetime,
+    format_attendance_record,
+)
+from app.models import EmployeeCreate, EpochMs, PunchInRequest, PunchOutRequest, RegularizeRequest
+from app.pipelines import (
+    build_attendance_list_query,
+    build_department_summary_pipeline,
+    build_department_trend_pipeline,
+    build_employee_monthly_pipeline,
+    build_late_leaderboard_pipeline,
+)
 
-MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB = os.environ.get("MONGO_DB", "attendance_db")
-
-client = MongoClient(MONGO_URI, tz_aware=True)
-db = client[MONGO_DB]
-
-# ==============================================================================
-# SECTION 2: CONSTANTS & STATUSES
-# ==============================================================================
-IST = timezone(timedelta(hours=5, minutes=30))
-GRACE_PERIOD_SECONDS = 600  # 10 minutes strictly
-OVERTIME_MINIMUM_MINUTES = 30
-HALF_DAY_HOURS_THRESHOLD = 4.50
-
-PRESENCE_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
-ALL_STATUSES = {"PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"}
-
-# ==============================================================================
-# SECTION 3: PURE HELPER FUNCTIONS (Business Rules R1 - R8)
-# ==============================================================================
-def round_half_up(value: Optional[float | Decimal | int], decimals: int) -> Optional[float]:
-    """
-    R8 Rounding: Round half-up (away from zero, not banker's rounding).
-    """
-    if value is None:
-        return None
-    d = Decimal(str(value)) if not isinstance(value, Decimal) else value
-    fmt = "0." + "0" * decimals if decimals > 0 else "0"
-    return float(d.quantize(Decimal(fmt), rounding=ROUND_HALF_UP))
-
-
-def epoch_ms_to_datetime(ms: int) -> datetime:
-    """
-    R1: Instants are truncated to whole seconds before any calculation,
-    and stored as UTC timezone-aware datetime.
-    """
-    truncated_ms = (ms // 1000) * 1000
-    return datetime.fromtimestamp(truncated_ms / 1000, tz=timezone.utc).replace(microsecond=0)
-
-
-def datetime_to_epoch_ms(dt: Optional[datetime]) -> Optional[int]:
-    """
-    Convert a BSON datetime to epoch milliseconds.
-    """
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
-
-
-def attendance_date(punch_in: datetime, shift_start: str, shift_end: str) -> str:
-    """
-    R1 Dates and shifts:
-    Shift times and attendance dates are IST (UTC+05:30).
-    A record's date is the IST calendar date of its punch_in instant.
-    Exception - overnight shifts (shift_end <= shift_start, e.g. 22:00-06:00):
-    a punch-in whose IST time is strictly earlier than shift_end belongs to the
-    shift that started the previous day.
-    """
-    in_ist = punch_in.astimezone(IST).replace(microsecond=0)
-    cal_date = in_ist.date()
-    p_time = in_ist.time()
-
-    start_h, start_m = map(int, shift_start.split(":"))
-    end_h, end_m = map(int, shift_end.split(":"))
-    is_overnight = (end_h, end_m) <= (start_h, start_m)
-
-    if is_overnight and p_time < time(end_h, end_m, 0):
-        return (cal_date - timedelta(days=1)).isoformat()
-    return cal_date.isoformat()
+__all__ = [
+    "app",
+    "db",
+    "client",
+    "IST",
+    "round_half_up",
+    "attendance_date",
+    "compute_late_minutes",
+    "compute_overtime_minutes",
+    "compute_work_hours",
+    "compute_half_day",
+    "calculate_working_days",
+    "datetime_to_epoch_ms",
+    "epoch_ms_to_datetime",
+    "format_attendance_record",
+    "EmployeeCreate",
+    "PunchInRequest",
+    "PunchOutRequest",
+    "RegularizeRequest",
+    "EpochMs",
+    "build_attendance_list_query",
+    "build_department_summary_pipeline",
+    "build_department_trend_pipeline",
+    "build_employee_monthly_pipeline",
+    "build_late_leaderboard_pipeline",
+]
 
 
-def compute_late_minutes(punch_in: datetime, shift_start: str, att_date_str: str) -> int:
-    """
-    R2 Late threshold:
-    Grace period is 10 minutes. A punch-in is late only if strictly more than
-    10:00 after shift_start. When late, late_minutes = whole minutes (floor)
-    elapsed since shift_start. Otherwise 0.
-    """
-    att_date = date.fromisoformat(att_date_str)
-    start_h, start_m = map(int, shift_start.split(":"))
-    start_dt_ist = datetime.combine(att_date, time(start_h, start_m, 0), tzinfo=IST)
-
-    in_ist = punch_in.astimezone(IST).replace(microsecond=0)
-    delta_sec = (in_ist - start_dt_ist).total_seconds()
-
-    if delta_sec > GRACE_PERIOD_SECONDS:
-        return int(delta_sec // 60)
-    return 0
-
-
-def compute_overtime_minutes(punch_out: datetime, shift_start: str, shift_end: str, att_date_str: str) -> int:
-    """
-    R3 Overtime:
-    overtime_minutes = whole minutes (floor) between shift_end and punch_out,
-    counted only when >= 30; otherwise 0.
-    For overnight shifts, shift_end falls on the next calendar day.
-    """
-    att_date = date.fromisoformat(att_date_str)
-    start_h, start_m = map(int, shift_start.split(":"))
-    end_h, end_m = map(int, shift_end.split(":"))
-
-    if (end_h, end_m) <= (start_h, start_m):
-        end_date = att_date + timedelta(days=1)
-    else:
-        end_date = att_date
-
-    end_dt_ist = datetime.combine(end_date, time(end_h, end_m, 0), tzinfo=IST)
-    out_ist = punch_out.astimezone(IST).replace(microsecond=0)
-    delta_sec = (out_ist - end_dt_ist).total_seconds()
-
-    if delta_sec <= 0:
-        return 0
-    ot_minutes = int(delta_sec // 60)
-    return ot_minutes if ot_minutes >= OVERTIME_MINIMUM_MINUTES else 0
-
-
-def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    """
-    R4 Work hours:
-    (punch_out - punch_in) in seconds / 3600, rounded to 2 decimals half-up.
-    """
-    in_sec = int(punch_in.timestamp())
-    out_sec = int(punch_out.timestamp())
-    diff_sec = out_sec - in_sec
-    hours_d = Decimal(diff_sec) / Decimal(3600)
-    return float(hours_d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-
-
-def compute_half_day(work_hours: Optional[float]) -> bool:
-    """
-    R5 Half days:
-    half_day = true when the rounded work_hours < 4.50.
-    """
-    if work_hours is None:
-        return False
-    return work_hours < HALF_DAY_HOURS_THRESHOLD
-
-
-def calculate_working_days(joined_on_str: str, month_str: str) -> int:
-    """
-    R7 Working days:
-    Mon-Fri, no holiday calendar. For an employee who joined mid-month,
-    working days are counted from joined_on.
-    """
-    year, m = map(int, month_str.split("-"))
-    _, last_day = calendar.monthrange(year, m)
-    start_month = f"{month_str}-01"
-    end_month = f"{month_str}-{last_day:02d}"
-
-    if joined_on_str > end_month:
-        return 0
-
-    cur_date_str = max(start_month, joined_on_str)
-    cur_date = date.fromisoformat(cur_date_str)
-    end_date = date.fromisoformat(end_month)
-
-    working_days = 0
-    while cur_date <= end_date:
-        if cur_date.weekday() < 5:  # Mon=0..Fri=4
-            working_days += 1
-        cur_date += timedelta(days=1)
-    return working_days
-
-
-def format_attendance_record(doc: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Format an internal attendance document into OpenAPI AttendanceRecord.
-    Truncates/converts all dates and nested history to epoch ms.
-    """
-    history_out = []
-    for h in doc.get("history", []):
-        changes_out = {}
-        for k, v in h.get("changes", {}).items():
-            f_val = v.get("from")
-            t_val = v.get("to")
-            if k in ("punch_in", "punch_out"):
-                f_val = datetime_to_epoch_ms(f_val) if isinstance(f_val, datetime) else f_val
-                t_val = datetime_to_epoch_ms(t_val) if isinstance(t_val, datetime) else t_val
-            changes_out[k] = {"from": f_val, "to": t_val}
-
-        history_out.append({
-            "at": datetime_to_epoch_ms(h.get("at")),
-            "by": h.get("by"),
-            "reason": h.get("reason"),
-            "changes": changes_out,
-        })
-
-    return {
-        "emp_code": doc["emp_code"],
-        "date": doc["date"],
-        "status": doc["status"],
-        "punch_in": datetime_to_epoch_ms(doc.get("punch_in")),
-        "punch_out": datetime_to_epoch_ms(doc.get("punch_out")),
-        "work_hours": doc.get("work_hours"),
-        "late_minutes": doc.get("late_minutes", 0),
-        "overtime_minutes": doc.get("overtime_minutes", 0),
-        "half_day": doc.get("half_day", False),
-        "history": history_out,
-    }
-
-# ==============================================================================
-# SECTION 4: PYDANTIC MODELS & VALIDATION
-# ==============================================================================
-def validate_epoch_ms(v: Any) -> int:
-    if isinstance(v, bool) or not isinstance(v, int):
-        raise ValueError("Epoch milliseconds must be an integer, not float or string")
-    if v < 100_000_000_000 or v > 4_102_444_800_000:
-        raise ValueError("Epoch milliseconds out of valid range (100000000000 to 4102444800000)")
-    return v
-
-EpochMs = Annotated[int, BeforeValidator(validate_epoch_ms)]
-
-
-class EmployeeCreate(BaseModel):
-    emp_code: str = Field(..., pattern=r"^EMP\d{4,6}$")
-    name: str = Field(..., min_length=1, max_length=100)
-    email: str = Field(..., max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-    department: str = Field(..., min_length=1, max_length=50)
-    shift_start: str = Field("09:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    shift_end: str = Field("18:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
-    joined_on: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
-
-    @field_validator("shift_end")
-    @classmethod
-    def validate_shifts(cls, v, info):
-        if "shift_start" in info.data and v == info.data["shift_start"]:
-            raise ValueError("shift_start and shift_end must differ")
-        return v
-
-    @field_validator("joined_on")
-    @classmethod
-    def validate_joined_on(cls, v):
-        try:
-            date.fromisoformat(v)
-        except ValueError:
-            raise ValueError("Invalid calendar date for joined_on")
-        return v
-
-
-class PunchInRequest(BaseModel):
-    emp_code: str
-    punched_at: Optional[EpochMs] = None
-    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
-
-
-class PunchOutRequest(BaseModel):
-    emp_code: str
-    punched_at: Optional[EpochMs] = None
-
-
-class RegularizeRequest(BaseModel):
-    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
-    punch_in: Optional[EpochMs] = None
-    punch_out: Optional[EpochMs] = None
-    reason: str = Field(..., min_length=5, max_length=200)
-    regularized_by: str = Field(..., min_length=1, max_length=50)
-
-# ==============================================================================
-# SECTION 5: STARTUP & IDEMPOTENT INDEX CREATION
-# ==============================================================================
 def create_indexes():
-    """
-    Creates all nine indexes idempotently at application startup:
-    - employees.emp_code (unique)
-    - employees.department
-    - attendance_logs.(emp_code, date) (unique)
-    - attendance_logs.(date, emp_code) (compound: date desc, emp_code asc)
-    - attendance_logs.emp_code
-    """
+    """Ensure indexes exist on startup."""
     db.employees.create_index("emp_code", unique=True)
     db.employees.create_index("department")
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
@@ -301,485 +78,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Attendance & Analytics API", lifespan=lifespan)
 
-# ==============================================================================
-# SECTION 6: EXPLAIN QUERY / PIPELINE BUILDERS
-# ==============================================================================
-def build_attendance_list_query(
-    emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
-) -> Tuple[str, Dict[str, Any], List[Tuple[str, int]], int, int]:
-    q: Dict[str, Any] = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-
-    sort_order = [("date", DESCENDING), ("emp_code", ASCENDING)]
-    skip = (page - 1) * page_size
-    return "attendance_logs", q, sort_order, skip, page_size
-
-
-def build_employee_monthly_pipeline(emp_code: str, month: str) -> Tuple[str, List[Dict[str, Any]]]:
-    year, m = map(int, month.split("-"))
-    _, last_day = calendar.monthrange(year, m)
-    start_date = f"{month}-01"
-    end_date = f"{month}-{last_day:02d}"
-
-    pipeline = [
-        {
-            "$match": {
-                "emp_code": emp_code,
-                "date": {"$gte": start_date, "$lte": end_date}
-            }
-        },
-        {
-            "$project": {
-                "status": 1,
-                "late_minutes": 1,
-                "overtime_minutes": 1,
-                "half_day": 1,
-                "day_of_week": {
-                    "$dayOfWeek": {
-                        "$dateFromString": {"dateString": "$date"}
-                    }
-                }
-            }
-        },
-        {
-            "$group": {
-                "_id": None,
-                "present_days": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                    {"$in": ["$day_of_week", [2, 3, 4, 5, 6]]}
-                                ]
-                            },
-                            {
-                                "$cond": [
-                                    {"$eq": ["$half_day", True]},
-                                    0.5,
-                                    1.0
-                                ]
-                            },
-                            0.0
-                        ]
-                    }
-                },
-                "leave_days": {
-                    "$sum": {
-                        "$cond": [
-                            {"$eq": ["$status", "LEAVE"]},
-                            1,
-                            0
-                        ]
-                    }
-                },
-                "late_count": {
-                    "$sum": {
-                        "$cond": [
-                            {"$gt": ["$late_minutes", 0]},
-                            1,
-                            0
-                        ]
-                    }
-                },
-                "total_late_minutes": {
-                    "$sum": {"$ifNull": ["$late_minutes", 0]}
-                },
-                "total_overtime_minutes": {
-                    "$sum": {"$ifNull": ["$overtime_minutes", 0]}
-                }
-            }
-        }
-    ]
-    return "attendance_logs", pipeline
-
-
-def build_department_summary_pipeline(month: str, department: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
-    year, m = map(int, month.split("-"))
-    _, last_day = calendar.monthrange(year, m)
-    start_date = f"{month}-01"
-    end_date = f"{month}-{last_day:02d}"
-
-    match_stage: Dict[str, Any] = {"joined_on": {"$lte": end_date}}
-    if department:
-        match_stage["department"] = department
-
-    pipeline = [
-        {"$match": match_stage},
-        {
-            "$lookup": {
-                "from": "attendance_logs",
-                "let": {"emp": "$emp_code"},
-                "pipeline": [
-                    {
-                        "$match": {
-                            "$expr": {
-                                "$and": [
-                                    {"$eq": ["$emp_code", "$$emp"]},
-                                    {"$gte": ["$date", start_date]},
-                                    {"$lte": ["$date", end_date]}
-                                ]
-                            }
-                        }
-                    }
-                ],
-                "as": "logs"
-            }
-        },
-        {"$unwind": {"path": "$logs", "preserveNullAndEmptyArrays": True}},
-        {
-            "$group": {
-                "_id": "$department",
-                "headcount_set": {"$addToSet": "$emp_code"},
-                "present_days": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$logs", None]},
-                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                    {
-                                        "$in": [
-                                            {
-                                                "$dayOfWeek": {
-                                                    "$dateFromString": {"dateString": "$logs.date"}
-                                                }
-                                            },
-                                            [2, 3, 4, 5, 6]
-                                        ]
-                                    }
-                                ]
-                            },
-                            {
-                                "$cond": [
-                                    {"$eq": ["$logs.half_day", True]},
-                                    0.5,
-                                    1.0
-                                ]
-                            },
-                            0.0
-                        ]
-                    }
-                },
-                "work_hours_sum": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$logs", None]},
-                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                    {"$ne": ["$logs.work_hours", None]}
-                                ]
-                            },
-                            "$logs.work_hours",
-                            0.0
-                        ]
-                    }
-                },
-                "work_hours_count": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$logs", None]},
-                                    {"$in": ["$logs.status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                                    {"$ne": ["$logs.work_hours", None]}
-                                ]
-                            },
-                            1,
-                            0
-                        ]
-                    }
-                },
-                "late_count": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$logs", None]},
-                                    {"$gt": ["$logs.late_minutes", 0]}
-                                ]
-                            },
-                            1,
-                            0
-                        ]
-                    }
-                },
-                "total_late_minutes": {
-                    "$sum": {
-                        "$cond": [
-                            {"$ne": ["$logs", None]},
-                            {"$ifNull": ["$logs.late_minutes", 0]},
-                            0
-                        ]
-                    }
-                },
-                "leave_count": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$logs", None]},
-                                    {"$eq": ["$logs.status", "LEAVE"]}
-                                ]
-                            },
-                            1,
-                            0
-                        ]
-                    }
-                },
-                "on_duty_count": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$ne": ["$logs", None]},
-                                    {"$eq": ["$logs.status", "ON_DUTY"]}
-                                ]
-                            },
-                            1,
-                            0
-                        ]
-                    }
-                }
-            }
-        },
-        {
-            "$project": {
-                "department": "$_id",
-                "headcount": {"$size": "$headcount_set"},
-                "present_days": 1,
-                "work_hours_sum": 1,
-                "work_hours_count": 1,
-                "late_count": 1,
-                "total_late_minutes": 1,
-                "leave_count": 1,
-                "on_duty_count": 1
-            }
-        },
-        {"$match": {"headcount": {"$gt": 0}}},
-        {"$sort": {"department": 1}}
-    ]
-    return "employees", pipeline
-
-
-def build_late_leaderboard_pipeline(month: str, limit: int = 10, department: Optional[str] = None) -> Tuple[str, List[Dict[str, Any]]]:
-    year, m = map(int, month.split("-"))
-    _, last_day = calendar.monthrange(year, m)
-    start_date = f"{month}-01"
-    end_date = f"{month}-{last_day:02d}"
-
-    pipeline: List[Dict[str, Any]] = [
-        {
-            "$match": {
-                "date": {"$gte": start_date, "$lte": end_date},
-                "late_minutes": {"$gt": 0}
-            }
-        },
-        {
-            "$group": {
-                "_id": "$emp_code",
-                "total_late_minutes": {"$sum": "$late_minutes"},
-                "late_count": {"$sum": 1}
-            }
-        },
-        {
-            "$lookup": {
-                "from": "employees",
-                "localField": "_id",
-                "foreignField": "emp_code",
-                "as": "emp"
-            }
-        },
-        {"$unwind": "$emp"}
-    ]
-
-    if department:
-        pipeline.append({"$match": {"emp.department": department}})
-
-    pipeline.extend([
-        {
-            "$project": {
-                "emp_code": "$_id",
-                "name": "$emp.name",
-                "department": "$emp.department",
-                "total_late_minutes": 1,
-                "late_count": 1
-            }
-        },
-        {
-            "$setWindowFields": {
-                "sortBy": {"total_late_minutes": -1},
-                "output": {
-                    "rank": {"$rank": {}}
-                }
-            }
-        },
-        {
-            "$match": {"rank": {"$lte": limit}}
-        },
-        {
-            "$sort": {"total_late_minutes": -1, "emp_code": 1}
-        }
-    ])
-    return "attendance_logs", pipeline
-
-
-def build_department_trend_pipeline(department: str, from_str: str, to_str: str) -> Tuple[str, List[Dict[str, Any]]]:
-    from_dt = datetime.fromisoformat(from_str).replace(tzinfo=timezone.utc)
-    to_dt = datetime.fromisoformat(to_str).replace(tzinfo=timezone.utc)
-    to_dt_bound = to_dt + timedelta(days=1)
-
-    pipeline = [
-        {
-            "$match": {
-                "date": {"$gte": from_str, "$lte": to_str}
-            }
-        },
-        {
-            "$lookup": {
-                "from": "employees",
-                "localField": "emp_code",
-                "foreignField": "emp_code",
-                "as": "emp"
-            }
-        },
-        {"$unwind": "$emp"},
-        {"$match": {"emp.department": department}},
-        {
-            "$group": {
-                "_id": "$date",
-                "present_count": {
-                    "$sum": {
-                        "$cond": [
-                            {"$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]},
-                            {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]},
-                            0.0
-                        ]
-                    }
-                },
-                "late_count": {
-                    "$sum": {
-                        "$cond": [
-                            {"$gt": ["$late_minutes", 0]},
-                            1,
-                            0
-                        ]
-                    }
-                }
-            }
-        },
-        {
-            "$project": {
-                "date_dt": {"$dateFromString": {"dateString": "$_id"}},
-                "present_count": 1,
-                "late_count": 1
-            }
-        },
-        {
-            "$densify": {
-                "field": "date_dt",
-                "range": {
-                    "step": 1,
-                    "unit": "day",
-                    "bounds": [from_dt, to_dt_bound]
-                }
-            }
-        },
-        {
-            "$project": {
-                "date_dt": 1,
-                "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$date_dt"}},
-                "present_count": {"$ifNull": ["$present_count", 0.0]},
-                "late_count": {"$ifNull": ["$late_count", 0]},
-                "day_of_week": {"$dayOfWeek": "$date_dt"}
-            }
-        },
-        {
-            "$lookup": {
-                "from": "employees",
-                "let": {"cur_day": "$date"},
-                "pipeline": [
-                    {
-                        "$match": {
-                            "$expr": {
-                                "$and": [
-                                    {"$eq": ["$department", department]},
-                                    {"$lte": ["$joined_on", "$$cur_day"]}
-                                ]
-                            }
-                        }
-                    }
-                ],
-                "as": "dept_emps"
-            }
-        },
-        {
-            "$project": {
-                "date": 1,
-                "date_dt": 1,
-                "is_working_day": {"$in": ["$day_of_week", [2, 3, 4, 5, 6]]},
-                "headcount": {"$size": "$dept_emps"},
-                "present_count": 1,
-                "late_count": 1,
-            }
-        },
-        {
-            "$project": {
-                "date": 1,
-                "date_dt": 1,
-                "is_working_day": 1,
-                "headcount": 1,
-                "present_count": 1,
-                "late_count": 1,
-                "attendance_rate": {
-                    "$cond": [
-                        {
-                            "$and": [
-                                {"$eq": ["$is_working_day", True]},
-                                {"$gt": ["$headcount", 0]}
-                            ]
-                        },
-                        {"$divide": ["$present_count", "$headcount"]},
-                        None
-                    ]
-                }
-            }
-        },
-        {
-            "$setWindowFields": {
-                "sortBy": {"date_dt": 1},
-                "output": {
-                    "moving_avg_7d": {
-                        "$avg": "$attendance_rate",
-                        "window": {
-                            "documents": [-6, "current"]
-                        }
-                    }
-                }
-            }
-        },
-        {"$sort": {"date": 1}}
-    ]
-    return "attendance_logs", pipeline
-
-# ==============================================================================
-# SECTION 7: ENDPOINTS
-# ==============================================================================
 
 # --- System ---
 @app.get("/health", tags=["system"])
@@ -858,11 +156,7 @@ def punch_in(body: PunchInRequest):
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    if body.punched_at is not None:
-        punch_in_dt = epoch_ms_to_datetime(body.punched_at)
-    else:
-        punch_in_dt = datetime.now(timezone.utc).replace(microsecond=0)
-
+    punch_in_dt = epoch_ms_to_datetime(body.punched_at) if body.punched_at is not None else datetime.now(timezone.utc).replace(microsecond=0)
     att_date = attendance_date(punch_in_dt, emp["shift_start"], emp["shift_end"])
     late_mins = compute_late_minutes(punch_in_dt, emp["shift_start"], att_date)
 
@@ -893,12 +187,8 @@ def punch_out(body: PunchOutRequest):
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    if body.punched_at is not None:
-        punch_out_dt = epoch_ms_to_datetime(body.punched_at)
-    else:
-        punch_out_dt = datetime.now(timezone.utc).replace(microsecond=0)
+    punch_out_dt = epoch_ms_to_datetime(body.punched_at) if body.punched_at is not None else datetime.now(timezone.utc).replace(microsecond=0)
 
-    # Closes the employee's most recent record whose punch_in is at or before punched_at
     candidate = db.attendance_logs.find_one(
         {
             "emp_code": body.emp_code,
@@ -954,9 +244,8 @@ def list_attendance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
 ):
-    if date_from and date_to:
-        if date_from > date_to:
-            raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
 
     if status and status not in ALL_STATUSES:
         raise HTTPException(status_code=422, detail="Invalid status")
@@ -1105,7 +394,6 @@ def employee_monthly(
         raise HTTPException(status_code=404, detail="Employee not found")
 
     working_days = calculate_working_days(emp["joined_on"], month)
-
     _, pipeline = build_employee_monthly_pipeline(emp_code, month)
     res = list(db.attendance_logs.aggregate(pipeline))
 
@@ -1123,10 +411,7 @@ def employee_monthly(
         total_late_minutes = 0
         total_overtime_minutes = 0
 
-    if working_days > 0:
-        attendance_pct = round_half_up((present_days / working_days) * 100, 4)
-    else:
-        attendance_pct = None
+    attendance_pct = round_half_up((present_days / working_days) * 100, 4) if working_days > 0 else None
 
     return {
         "emp_code": emp_code,
@@ -1151,10 +436,7 @@ def department_summary(
 
     items = []
     for row in cursor:
-        avg_wh = None
-        if row["work_hours_count"] > 0:
-            avg_wh = round_half_up(row["work_hours_sum"] / row["work_hours_count"], 2)
-
+        avg_wh = round_half_up(row["work_hours_sum"] / row["work_hours_count"], 2) if row["work_hours_count"] > 0 else None
         items.append({
             "department": row["department"],
             "headcount": row["headcount"],
@@ -1255,11 +537,10 @@ def admin_explain(
             page=page,
             page_size=page_size
         )
-        sort_dict = dict(sort_order)
         explain_cmd = {
             "find": coll,
             "filter": q,
-            "sort": sort_dict,
+            "sort": dict(sort_order),
             "skip": skip,
             "limit": p_size
         }
