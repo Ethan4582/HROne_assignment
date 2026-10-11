@@ -1,5 +1,11 @@
 # Attendance & Analytics API
 
+[![Architecture Decisions](https://img.shields.io/badge/Architecture-DECISIONS.md-bc8c74?style=flat-square)](./DECISIONS.md)
+[![Defect Review](https://img.shields.io/badge/Audit-REVIEW.md-4a5568?style=flat-square)](./REVIEW.md)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776ab?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-6.0+-47a248?style=flat-square&logo=mongodb&logoColor=white)](https://www.mongodb.com/)
+
 FastAPI service for employee attendance tracking and reporting over MongoDB.
 
 ## Prerequisites
